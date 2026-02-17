@@ -671,7 +671,7 @@
             const authUrl =
                 'https://accounts.google.com/o/oauth2/v2/auth' +
                 '?client_id=' + encodeURIComponent(CLIENT_ID) +
-                '&redirect_uri=' + encodeURIComponent(window.location.origin + window.location.pathname) +
+                '&redirect_uri=' + encodeURIComponent('https://haterpicks.github.io/hp-lab/') +
                 '&response_type=token' +
                 '&scope=' + encodeURIComponent(SCOPES) +
                 '&prompt=consent';
@@ -691,7 +691,7 @@
                         return;
                     }
                     const href = popup.location.href;
-                    if (href && href.indexOf(window.location.origin) === 0) {
+                    if (href && href.indexOf('https://haterpicks.github.io') === 0) {
                         clearInterval(poll);
                         popup.close();
 
