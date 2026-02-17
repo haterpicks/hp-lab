@@ -630,7 +630,6 @@
     
     <!-- Google API -->
     <script src="https://apis.google.com/js/api.js"></script>
-    <script src="https://accounts.google.com/gsi/client" async defer></script>
     
     <!-- Firebase SDK -->
     <script type="module">
@@ -659,66 +658,74 @@
     </script>
     
     <script>
-        // TODO: Replace with your Google Cloud credentials
         const CLIENT_ID = '505777325542-2ji9hev1umil4qi18hrccqe3noglie4t.apps.googleusercontent.com';
         const API_KEY = 'AIzaSyBTD_wOtcmwHZUi1upRE89gv5A7hTHJrAA';
-        const DISCOVERY_DOCS = ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'];
         const SCOPES = 'https://www.googleapis.com/auth/drive.readonly';
-        
-        let tokenClient;
-        let gapiInited = false;
-        let gisInited = false;
+
+        let accessToken = null;
         let syncIntervalId;
         let isAutoSyncing = true;
-        
-        // Initialize Google API
-        function gapiLoaded() {
-            gapi.load('client', initializeGapiClient);
-        }
-        
-        async function initializeGapiClient() {
-            await gapi.client.init({
-                apiKey: API_KEY,
-                discoveryDocs: DISCOVERY_DOCS,
-            });
-            gapiInited = true;
-        }
-        
-        function gisLoaded() {
-            tokenClient = google.accounts.oauth2.initTokenClient({
-                client_id: CLIENT_ID,
-                scope: SCOPES,
-                callback: '',
-            });
-            gisInited = true;
-        }
-        
-        // Auth handler
+
+        // ── OAuth2 via popup ──────────────────────────────────────────────
         function handleAuthClick() {
-            tokenClient.callback = async (resp) => {
-                if (resp.error !== undefined) {
-                    showError('Authentication failed: ' + resp.error);
-                    return;
+            const authUrl =
+                'https://accounts.google.com/o/oauth2/v2/auth' +
+                '?client_id=' + encodeURIComponent(CLIENT_ID) +
+                '&redirect_uri=' + encodeURIComponent(window.location.origin + window.location.pathname) +
+                '&response_type=token' +
+                '&scope=' + encodeURIComponent(SCOPES) +
+                '&prompt=consent';
+
+            // Open popup
+            const w = 500, h = 600;
+            const left = window.screenX + (window.outerWidth  - w) / 2;
+            const top  = window.screenY + (window.outerHeight - h) / 2;
+            const popup = window.open(authUrl, 'googleAuth',
+                'width=' + w + ',height=' + h + ',left=' + left + ',top=' + top);
+
+            // Poll until popup redirects back with token
+            const poll = setInterval(function() {
+                try {
+                    if (!popup || popup.closed) {
+                        clearInterval(poll);
+                        return;
+                    }
+                    const href = popup.location.href;
+                    if (href && href.indexOf(window.location.origin) === 0) {
+                        clearInterval(poll);
+                        popup.close();
+
+                        // Extract access_token from hash fragment
+                        const hash = popup.location.hash || href.split('#')[1] || '';
+                        const params = {};
+                        hash.replace(/^#/, '').split('&').forEach(function(p) {
+                            const parts = p.split('=');
+                            params[decodeURIComponent(parts[0])] = decodeURIComponent(parts[1] || '');
+                        });
+
+                        if (params.access_token) {
+                            accessToken = params.access_token;
+                            onAuthSuccess();
+                        } else {
+                            showError('Sign-in failed. Please try again.');
+                        }
+                    }
+                } catch (e) {
+                    // Cross-origin — still waiting
                 }
-                
-                document.getElementById('fileIdInput').disabled = false;
-                document.getElementById('saveFileIdBtn').disabled = false;
-                
-                showSuccess('✓ Connected to Google Drive! Now enter your CSV File ID.');
-                
-                // Check for saved config
-                const savedFileId = localStorage.getItem('hplab_fileId');
-                if (savedFileId) {
-                    document.getElementById('fileIdInput').value = savedFileId;
-                    showSyncSection();
-                    startAutoSync();
-                }
-            };
-            
-            if (gapi.client.getToken() === null) {
-                tokenClient.requestAccessToken({prompt: 'consent'});
-            } else {
-                tokenClient.requestAccessToken({prompt: ''});
+            }, 300);
+        }
+
+        function onAuthSuccess() {
+            document.getElementById('fileIdInput').disabled = false;
+            document.getElementById('saveFileIdBtn').disabled = false;
+            showSuccess('✓ Connected to Google Drive! Now enter your CSV File ID.');
+
+            const savedFileId = localStorage.getItem('hplab_fileId');
+            if (savedFileId) {
+                document.getElementById('fileIdInput').value = savedFileId;
+                showSyncSection();
+                startAutoSync();
             }
         }
         
@@ -780,51 +787,62 @@
             btn.classList.remove('syncing');
         }
         
-        // Sync from Google Drive
+        // Sync from Google Drive using fetch + access token directly
         async function syncFromDrive() {
             const fileId = localStorage.getItem('hplab_fileId');
             if (!fileId) {
                 showError('No File ID configured');
                 return;
             }
-            
+            if (!accessToken) {
+                showError('Not connected to Google Drive. Please sign in first.');
+                return;
+            }
+
             try {
                 updateStatus('syncing', '⏳ Syncing from Google Drive...');
-                
-                // Get file from Google Drive
-                const response = await gapi.client.drive.files.get({
-                    fileId: fileId,
-                    alt: 'media'
-                });
-                
-                const csvContent = response.body;
-                const bets = parseCSV(csvContent);
-                
-                if (bets.length === 0) {
-                    throw new Error('No valid bets found in CSV');
+
+                const response = await fetch(
+                    'https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media',
+                    { headers: { 'Authorization': 'Bearer ' + accessToken } }
+                );
+
+                if (response.status === 401) {
+                    accessToken = null;
+                    showError('Google session expired. Please sign in again.');
+                    document.getElementById('setupSection').classList.remove('hidden');
+                    document.getElementById('syncSection').classList.add('hidden');
+                    return;
                 }
-                
-                // Save to Firebase
+
+                if (!response.ok) {
+                    throw new Error('Drive fetch failed: ' + response.status + ' ' + response.statusText);
+                }
+
+                const csvContent = await response.text();
+                const bets = parseCSV(csvContent);
+
+                if (bets.length === 0) {
+                    throw new Error('No valid bets found in CSV. Check the file has the right columns.');
+                }
+
                 await saveBetsToFirebase(bets);
-                
-                // Update UI
                 await loadBets();
-                
-                // Update timestamps
+
                 const now = new Date();
                 document.getElementById('lastSyncTime').textContent = now.toLocaleTimeString();
-                
+
                 const interval = parseInt(localStorage.getItem('hplab_syncInterval') || '300');
                 const nextSync = new Date(now.getTime() + interval * 1000);
                 document.getElementById('nextSyncTime').textContent = nextSync.toLocaleTimeString();
-                
+
                 updateStatus('connected', '✓ Connected & Syncing');
-                showSuccess(`✓ Synced ${bets.length} bets successfully!`);
-                
+                showSuccess('✓ Synced ' + bets.length + ' bets successfully!');
+
             } catch (error) {
                 console.error('Sync error:', error);
                 updateStatus('error', '⚠️ Sync failed');
-                showError('Sync failed: ' + error.message + '. Check File ID and permissions.');
+                showError('Sync failed: ' + error.message);
             }
         }
         
@@ -880,26 +898,21 @@
         
         // Disconnect
         function disconnect() {
-            if (!confirm('Disconnect from Google Drive? You will need to re-authorize.')) {
+            if (!confirm('Disconnect from Google Drive? You will need to sign in again.')) {
                 return;
             }
-            
+
             clearInterval(syncIntervalId);
             localStorage.removeItem('hplab_fileId');
             localStorage.removeItem('hplab_syncInterval');
-            
-            const token = gapi.client.getToken();
-            if (token !== null) {
-                google.accounts.oauth2.revoke(token.access_token);
-                gapi.client.setToken('');
-            }
-            
+            accessToken = null;
+
             document.getElementById('setupSection').classList.remove('hidden');
             document.getElementById('syncSection').classList.add('hidden');
             document.getElementById('fileIdInput').value = '';
             document.getElementById('fileIdInput').disabled = true;
             document.getElementById('saveFileIdBtn').disabled = true;
-            
+
             showSuccess('Disconnected successfully');
         }
         
@@ -1174,19 +1187,14 @@
         
         // Initialize on load
         window.onload = function() {
-            // Load Google API
-            gapiLoaded();
-            
-            // Check for saved configuration
-            setTimeout(() => {
-                const savedFileId = localStorage.getItem('hplab_fileId');
-                const token = gapi?.client?.getToken();
-                
-                if (savedFileId && token !== null) {
-                    showSyncSection();
-                    startAutoSync();
-                }
-            }, 1000);
+            // Load gapi for Drive discovery (not needed for auth anymore)
+            if (window.gapi) {
+                gapi.load('client', function() {
+                    gapi.client.init({ apiKey: API_KEY });
+                });
+            }
+            // Note: access token not persisted across page loads
+            // User must sign in each session - this is normal for OAuth implicit flow
         };
     </script>
 </body>
