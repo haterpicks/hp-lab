@@ -529,22 +529,23 @@
             </div>
             
             <div class="setup-step">
-                <h3>Step 2: Enter CSV File ID</h3>
+                <h3>Step 2: Enter Google Drive Folder ID</h3>
                 <p style="color: var(--text-secondary); margin-bottom: 10px;">
-                    Put your CSV file in Google Drive, then paste its File ID below.
+                    Create a folder in Google Drive and drop all your exported CSVs into it.
+                    HP-Lab will always read the most recently modified CSV automatically.
                 </p>
                 <div class="info-box">
-                    <p><strong>How to get File ID:</strong></p>
-                    <p>1. Right-click your CSV in Google Drive → "Share"</p>
-                    <p>2. Change to "Anyone with the link"</p>
-                    <p>3. Copy the link</p>
-                    <p>4. The ID is the long string between /d/ and /view</p>
-                    <p><em>Example: drive.google.com/file/d/<strong>1abc123xyz</strong>/view</em></p>
+                    <p><strong>How to get your Folder ID:</strong></p>
+                    <p>1. Open Google Drive and create a folder e.g. "HaterPicks Lab"</p>
+                    <p>2. Open the folder — look at the URL in your browser</p>
+                    <p>3. The URL looks like: drive.google.com/drive/folders/<strong>1abc123xyz</strong></p>
+                    <p>4. Copy the ID at the end (the bold part above)</p>
+                    <p>5. Make sure the folder is shared as "Anyone with the link"</p>
                 </div>
                 <input 
                     type="text" 
                     id="fileIdInput" 
-                    placeholder="Paste Google Drive File ID here (e.g., 1abc123xyz)"
+                    placeholder="Paste Google Drive Folder ID here"
                     disabled
                 />
                 <button id="saveFileIdBtn" onclick="saveFileId()" disabled>Save & Start Syncing</button>
@@ -574,7 +575,7 @@
                         <span style="font-weight: 600; font-size: 16px;" id="statusText">Initializing...</span>
                     </div>
                     <div style="font-size: 13px; color: var(--text-secondary); line-height: 1.8;">
-                        <div>📁 File: <span id="currentFileName">Not set</span></div>
+                        <div>📁 Folder: <span id="currentFileName">Not set</span></div>
                         <div>🔄 Last sync: <span id="lastSyncTime">Never</span></div>
                         <div>⏱️ Next sync: <span id="nextSyncTime">-</span></div>
                         <div>📊 Sync interval: <span id="syncIntervalDisplay">5 minutes</span></div>
@@ -787,11 +788,11 @@
             btn.classList.remove('syncing');
         }
         
-        // Sync from Google Drive using fetch + access token directly
+        // Find most recent CSV in folder, then read it
         async function syncFromDrive() {
-            const fileId = localStorage.getItem('hplab_fileId');
-            if (!fileId) {
-                showError('No File ID configured');
+            const folderId = localStorage.getItem('hplab_fileId');
+            if (!folderId) {
+                showError('No Folder ID configured');
                 return;
             }
             if (!accessToken) {
@@ -800,14 +801,20 @@
             }
 
             try {
-                updateStatus('syncing', '⏳ Syncing from Google Drive...');
+                updateStatus('syncing', '⏳ Finding latest CSV in folder...');
 
-                const response = await fetch(
-                    'https://www.googleapis.com/drive/v3/files/' + fileId + '?alt=media',
-                    { headers: { 'Authorization': 'Bearer ' + accessToken } }
-                );
+                // Step 1: List all CSVs in the folder, ordered by most recently modified
+                const listUrl = 'https://www.googleapis.com/drive/v3/files' +
+                    '?q=' + encodeURIComponent('\'' + folderId + '\' in parents and mimeType=\'text/csv\' and trashed=false') +
+                    '&orderBy=modifiedTime+desc' +
+                    '&pageSize=1' +
+                    '&fields=files(id,name,modifiedTime)';
 
-                if (response.status === 401) {
+                const listResp = await fetch(listUrl, {
+                    headers: { 'Authorization': 'Bearer ' + accessToken }
+                });
+
+                if (listResp.status === 401) {
                     accessToken = null;
                     showError('Google session expired. Please sign in again.');
                     document.getElementById('setupSection').classList.remove('hidden');
@@ -815,15 +822,35 @@
                     return;
                 }
 
-                if (!response.ok) {
-                    throw new Error('Drive fetch failed: ' + response.status + ' ' + response.statusText);
+                if (!listResp.ok) {
+                    throw new Error('Could not read folder: ' + listResp.status + '. Make sure folder is shared as Anyone with the link.');
                 }
 
-                const csvContent = await response.text();
+                const listData = await listResp.json();
+
+                if (!listData.files || listData.files.length === 0) {
+                    throw new Error('No CSV files found in folder. Export your CSV into the folder first.');
+                }
+
+                const latestFile = listData.files[0];
+                const modified  = new Date(latestFile.modifiedTime).toLocaleString();
+                updateStatus('syncing', '⏳ Reading: ' + latestFile.name + '...');
+
+                // Step 2: Download that file
+                const fileResp = await fetch(
+                    'https://www.googleapis.com/drive/v3/files/' + latestFile.id + '?alt=media',
+                    { headers: { 'Authorization': 'Bearer ' + accessToken } }
+                );
+
+                if (!fileResp.ok) {
+                    throw new Error('Could not download file: ' + fileResp.status);
+                }
+
+                const csvContent = await fileResp.text();
                 const bets = parseCSV(csvContent);
 
                 if (bets.length === 0) {
-                    throw new Error('No valid bets found in CSV. Check the file has the right columns.');
+                    throw new Error('No valid bets found in ' + latestFile.name + '. Check it has the right columns.');
                 }
 
                 await saveBetsToFirebase(bets);
@@ -831,13 +858,14 @@
 
                 const now = new Date();
                 document.getElementById('lastSyncTime').textContent = now.toLocaleTimeString();
+                document.getElementById('currentFileName').textContent = latestFile.name + ' (modified ' + modified + ')';
 
                 const interval = parseInt(localStorage.getItem('hplab_syncInterval') || '300');
                 const nextSync = new Date(now.getTime() + interval * 1000);
                 document.getElementById('nextSyncTime').textContent = nextSync.toLocaleTimeString();
 
                 updateStatus('connected', '✓ Connected & Syncing');
-                showSuccess('✓ Synced ' + bets.length + ' bets successfully!');
+                showSuccess('✓ Synced ' + bets.length + ' bets from ' + latestFile.name);
 
             } catch (error) {
                 console.error('Sync error:', error);
