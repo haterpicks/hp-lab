@@ -347,7 +347,7 @@
             border: 2px solid var(--border-color);
             position: relative;
             overflow: hidden;
-            transition: all 0.3s ease;
+            transition: all 0.3s ease, opacity 0.3s ease, transform 0.3s ease;
         }
         
         .bet-card:hover {
@@ -586,6 +586,7 @@
                         ⚡ Import Now
                     </button>
                     <div class="secondary-controls">
+                        <button onclick="clearAllBets()" class="secondary-btn" style="border-color: #EF4444; color: #EF4444;">🗑️ Clear All Bets</button>
                         <button onclick="testDriveAccess()" class="secondary-btn" style="border-color: var(--accent-orange); color: var(--accent-orange);">🔍 Test Drive Access</button>
                         <button onclick="toggleAutoSync()" id="toggleSyncBtn" class="secondary-btn">⏸ Pause Auto</button>
                         <button onclick="disconnect()" class="secondary-btn danger-btn">✕ Disconnect</button>
@@ -718,6 +719,9 @@
         }
 
         function onAuthSuccess() {
+            // Save token to localStorage for persistence
+            localStorage.setItem('hplab_accessToken', accessToken);
+            
             document.getElementById('fileIdInput').disabled = false;
             document.getElementById('saveFileIdBtn').disabled = false;
             showSuccess('✓ Connected to Google Drive! Now enter your CSV File ID.');
@@ -796,6 +800,65 @@
             btn.classList.remove('syncing');
         }
         
+        // Hide individual bet
+        async function hideBet(betId) {
+            if (!confirm('Hide this bet? It will be removed from both HP-Lab and Base44.')) {
+                return;
+            }
+
+            try {
+                const { doc, deleteDoc } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
+                
+                await deleteDoc(doc(window.db, 'bets', betId));
+                
+                // Remove from UI immediately
+                const card = document.querySelector(`[data-bet-id="${betId}"]`);
+                if (card) {
+                    card.style.opacity = '0';
+                    card.style.transform = 'scale(0.9)';
+                    setTimeout(() => card.remove(), 300);
+                }
+                
+                // Reload to update stats
+                setTimeout(() => loadBets(), 350);
+                
+                showSuccess('✓ Bet hidden');
+                
+            } catch (error) {
+                console.error('Hide error:', error);
+                showError('Failed to hide bet: ' + error.message);
+            }
+        }
+
+        // Clear all bets from Firebase
+        async function clearAllBets() {
+            if (!confirm('⚠️ This will delete ALL bets from The Lab and Base44.\n\nAre you sure?')) {
+                return;
+            }
+
+            try {
+                const { collection, getDocs, doc, deleteDoc } = await import('https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js');
+                
+                updateStatus('syncing', '🗑️ Clearing all bets...');
+                
+                const querySnapshot = await getDocs(collection(window.db, 'bets'));
+                const deletePromises = [];
+                querySnapshot.forEach((document) => {
+                    deletePromises.push(deleteDoc(doc(window.db, 'bets', document.id)));
+                });
+                
+                await Promise.all(deletePromises);
+                await loadBets();
+                
+                updateStatus('connected', '✓ All bets cleared');
+                showSuccess('✓ All bets deleted. Base44 will show empty on next refresh.');
+                
+            } catch (error) {
+                console.error('Clear error:', error);
+                showError('Failed to clear bets: ' + error.message);
+            }
+        }
+
         // Test Drive API access - shows raw response so user can diagnose
         async function testDriveAccess() {
             if (!accessToken) { showError('Please sign in first.'); return; }
@@ -1022,6 +1085,7 @@
             clearInterval(syncIntervalId);
             localStorage.removeItem('hplab_fileId');
             localStorage.removeItem('hplab_syncInterval');
+            localStorage.removeItem('hplab_accessToken');
             accessToken = null;
 
             document.getElementById('setupSection').classList.remove('hidden');
@@ -1074,6 +1138,13 @@
                 
                 if (isBetTracker) {
                     // Bet-tracker export format
+                    
+                    // Check if bet is marked as inactive
+                    const isActive = (bet.active || '').toLowerCase();
+                    if (isActive === 'false' || isActive === '0' || isActive === 'no') {
+                        continue; // Skip inactive bets
+                    }
+                    
                     // Determine type based on Tags field
                     let betType = 'positive-ev'; // default
                     const tags = (bet.tags || '').toLowerCase();
@@ -1169,8 +1240,24 @@
                 const querySnapshot = await getDocs(collection(window.db, 'bets'));
                 const bets = [];
                 
+                const now = new Date();
+                const EXPIRE_HOURS = 24; // Bets older than this are hidden
+                
                 querySnapshot.forEach((doc) => {
-                    bets.push({ id: doc.id, ...doc.data() });
+                    const betData = doc.data();
+                    const timestamp = betData.timestamp ? new Date(betData.timestamp) : null;
+                    const ageHours = timestamp ? (now - timestamp) / (1000 * 60 * 60) : 0;
+                    
+                    // Filter out:
+                    // 1. Bets older than EXPIRE_HOURS
+                    // 2. Completed bets (win/loss) - keep only pending
+                    const status = (betData.status || 'pending').toLowerCase();
+                    const isOld = timestamp && ageHours > EXPIRE_HOURS;
+                    const isCompleted = status === 'win' || status === 'loss';
+                    
+                    if (!isOld && !isCompleted) {
+                        bets.push({ id: doc.id, ...betData });
+                    }
                 });
                 
                 if (bets.length === 0) {
@@ -1222,6 +1309,9 @@
             
             card.className = `bet-card ${isArbitrage ? 'arbitrage' : 'positive-ev'}`;
             
+            // Add hide button
+            card.setAttribute('data-bet-id', bet.id);
+            
             // Build sport/league badge if available
             let sportBadge = '';
             if (bet.sport || bet.league) {
@@ -1239,10 +1329,13 @@
             }
             
             card.innerHTML = `
-                <span class="bet-type ${isArbitrage ? 'arbitrage' : 'positive-ev'}">
-                    ${isArbitrage ? 'Arbitrage' : 'Positive EV'}
-                </span>
-                ${statusBadge}
+                <div style="position: relative;">
+                    <span class="bet-type ${isArbitrage ? 'arbitrage' : 'positive-ev'}">
+                        ${isArbitrage ? 'Arbitrage' : 'Positive EV'}
+                    </span>
+                    ${statusBadge}
+                    <button onclick="hideBet('${bet.id}')" style="position: absolute; top: 0; right: 0; background: #EF4444; color: white; border: none; border-radius: 50%; width: 24px; height: 24px; cursor: pointer; font-size: 14px; font-weight: bold; opacity: 0.7; transition: opacity 0.2s;" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.7'" title="Hide this bet">✕</button>
+                </div>
                 <div style="clear: both;"></div>
                 ${sportBadge}
                 <div class="bet-title">${bet.title}</div>
@@ -1304,10 +1397,34 @@
         
         // Initialize on load
         window.onload = function() {
-            // Load gapi for Drive discovery (not needed for auth anymore)
-            // OAuth access token is all we need - no API key required
-            // Note: access token not persisted across page loads
-            // User must sign in each session - this is normal for OAuth implicit flow
+            // Try to restore saved access token for auto-login
+            const savedToken = localStorage.getItem('hplab_accessToken');
+            const savedFileId = localStorage.getItem('hplab_fileId');
+            
+            if (savedToken && savedFileId) {
+                accessToken = savedToken;
+                // Test if token still valid
+                fetch('https://www.googleapis.com/drive/v3/about?fields=user', {
+                    headers: { 'Authorization': 'Bearer ' + savedToken }
+                })
+                .then(resp => {
+                    if (resp.ok) {
+                        // Token still valid - auto-login
+                        showSuccess('✓ Automatically signed in');
+                        document.getElementById('fileIdInput').value = savedFileId;
+                        showSyncSection();
+                        startAutoSync();
+                    } else {
+                        // Token expired - clear it
+                        localStorage.removeItem('hplab_accessToken');
+                        accessToken = null;
+                    }
+                })
+                .catch(() => {
+                    localStorage.removeItem('hplab_accessToken');
+                    accessToken = null;
+                });
+            }
         };
     </script>
 </body>
